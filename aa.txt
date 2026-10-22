@@ -1,0 +1,37 @@
+You are working on an existing Streamlit app (streamlit_app.py) called "Index Performance Monitor", used by a QIS rates trader at a bank. It fetches daily PX_LAST for a Bloomberg index via ezbbg (fetch_history), and currently shows:
+- Sidebar: index selector / Bloomberg ticker, start date, "Analyze" button
+- KPI cards: latest level, period high, period low, best daily performance, worst daily performance (with dates)
+- Chart 1: index level; Chart 2: daily return
+- Expander: "Period extrema and recent observations"
+
+GOAL
+Keep everything above exactly as it is (same look, same behavior) and extend the app into a proper index monitoring tool for a QIS trader. The test subject is "SGI France 10Y Bond Future Index (EUR - Excess Return)" (SGIXBOA), but everything must work for any index selected.
+
+HARD CONSTRAINTS
+- Daily performance stays the simple daily return (P_t / P_{t-1} - 1), never cumulative. Annualize with 252 days. Index is already excess return, so do not subtract cash for Sharpe.
+- Do not hardcode credentials. Read the Bloomberg user and token only from environment variables (EZBBG_USER, EZBBG_TOKEN). Remove any hardcoded value in the source.
+- Fetch data once per (ticker, start, end) with st.cache_data (TTL ~15 min). All new analytics are computed from that one series, with no extra Bloomberg calls except for the optional benchmark/compare features.
+- Use Plotly with the existing dark theme. Put new content in tabs: Overview (the current page, untouched) | Risk | Rolling & Regimes | Distribution | Compare | Data Quality. Add quick period buttons (1M, 3M, YTD, 1Y, 3Y, 5Y, Max) and a log-scale toggle on the level chart.
+- Put the analytics in a separate module (analytics.py) as pure, unit-testable functions. Handle NaNs, short histories and stale prices gracefully.
+
+PRIORITY 1 (must have)
+1. Risk/return KPI row: annualized return, realized vol, Sharpe, Sortino, Calmar, max drawdown, current drawdown, skew, excess kurtosis, hit ratio, historical VaR/CVaR 95% and 99%.
+2. Drawdown tab: underwater chart + table of the top 5 drawdowns (start, trough, recovery date, depth, duration in days, recovery time).
+3. Rolling vol (20d, 60d, 250d) vs long-run average, with the current vol shown as a percentile of its own history and an EWMA vol (lambda 0.94). Also a vol-of-vol / vol regime label (low / normal / high).
+4. Rolling returns (1M, 3M, 6M, 1Y) and rolling Sharpe (1Y).
+5. Calendar returns: monthly heatmap (years x months) and yearly bar chart.
+6. Alert panel at the top of the Overview, with traffic lights and thresholds configurable in the sidebar: last-day move z-score (> 3 sigma), 20d vol vs 1Y median vol, drawdown vs limit, price vs 50d/200d MA (trend state), data staleness (last observation older than 1 business day).
+
+PRIORITY 2 (valuable)
+7. Distribution tab: return histogram with normal overlay, QQ plot, tail stats, tables of the 10 worst/best days (date, return, z-score).
+8. Compare tab: select 1-4 other Bloomberg indices/tickers, show rebased-to-100 performance, a correlation matrix, rolling 60d correlation and beta vs a chosen benchmark, plus a relative performance (spread) chart.
+9. Rates-specific analytics: autocorrelation of daily returns (lag 1-10) and variance ratio/Hurst (trend vs mean-reversion character), day-of-week effect, performance conditional on vol regime (low/high vol terciles), and rolling beta to 10Y yield changes if a yield ticker is selectable.
+10. Data Quality tab: missing business days, stale/unchanged prices, outlier jumps flagged by robust z-score (MAD), last update timestamp, number of observations.
+11. Export: download button for the computed stats table and cleaned series (CSV/Excel).
+
+DELIVERABLES
+- Updated streamlit_app.py + analytics.py, with a short README section on how to run (env vars, streamlit run).
+- A few pytest tests for the analytics functions (drawdown, VaR, rolling vol) using synthetic data.
+- Run the app on SGIXBOA and on one other index to verify nothing in the original page changed, then summarize what was added in a short changelog.
+
+Work step by step: first propose the module structure, then implement Priority 1, validate, then Priority 2.
