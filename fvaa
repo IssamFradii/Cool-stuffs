@@ -1,0 +1,1218 @@
+#!/usr/bin/env python3
+"""
+fva_rv_lab.py - Forward vol (FVA) vs spot vol: regression, beta, carry and backtests
+for swaption ATM normal vols.
+
+Research tool, not production. Conventions
+  * vols are ATM normal (bp/yr), time in years, business-day index (252 days/yr)
+  * an FVA point "SxExN" = forward start S (strike fixing), option expiry E after the
+    start, swap tenor N.  e.g. 1Yx1Yx10Y = 1y10y straddle struck ATM in one year
+  * position +1 = LONG forward vol (long FVA); P&L is in vol bp per unit of vega notional
+  * "spread" trades = long FVA vega 1 vs short beta x spot ExN straddle vega (delta-hedged)
+
+Two backtest engines
+  * tranche  : enter every day, fixed horizon, average the overlapping trades. Measures the
+               SIGNAL (expected P&L conditional on the signal). Costs charged per tranche.
+  * event    : one trade at a time - enter on signal, exit on reversion / max hold / fixing,
+               daily MTM with forward-start roll-down and spot-leg gamma/theta. Measures the
+               TRADE you would actually run. Costs charged per round trip.
+
+FVA-only strategies (no swaption leg): the carry of an FVA is its roll along the forward-vol curve,
+  roll_h = F(start - h) - F(start) on today's surface; at fixing it has rolled into spot vol.
+  carry-to-risk = roll_h / h-day vol of the forward; score = z(carry-to-risk) - residual z (value).
+  ev_fva_carry, ev_fva_carry_value (outright FVA), pair_* (FVA vs FVA), xs_carry (cross-sectional book).
+
+Quick start
+  python fva_rv_lab.py --selftest           # unit checks + recovery checks on synthetic surfaces
+  python fva_rv_lab.py --demo               # synthetic surface: diagnostics, rankings, snapshot, charts
+  python fva_rv_lab.py --csv vols.csv --points 3Mx3Mx10Y,6Mx6Mx10Y,1Yx1Yx10Y --split 2021-01-01
+  python fva_rv_lab.py --csv vols.csv --points 3Mx3Mx10Y,6Mx6Mx10Y,6Mx1Yx10Y,1Yx1Yx10Y --xs \
+      --pairs 6Mx1Yx10Y:2Yx1Yx10Y --split 2021-01-01   # FVA-only: pairs + cross-sectional carry book
+
+CSV layout (one row per business day, first column = date)
+  1Mx10Y, 3Mx10Y, 6Mx10Y, 9Mx10Y, 1Yx10Y, 18Mx10Y, 2Yx10Y, 3Yx10Y ...   ATM normal vols (bp)
+  FVA_1Yx1Yx10Y   optional: your FVA marks / replicated FVA levels (bp) - used as the traded level
+  MC_1Yx1Yx10Y    optional: midcurve vol, expiry 1Y, on the 10Y swap starting 1Y after expiry
+  SWAP_10Y        optional: swap rate in % (realized vol -> VRP signal and spot-leg gamma/theta)
+
+The forward vol defaults to the fixed-tenor calendar (total-variance additivity along expiry):
+    sigma_F^2 * E = sigma(S+E, N)^2 * (S+E) - sigma(S, N)^2 * S
+Midcurve vols make it exact on the right underlying; FVA marks override both.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import re
+from dataclasses import dataclass
+from typing import Callable
+
+import numpy as np
+import pandas as pd
+
+TD = 252  # business days per year
+
+# =============================================================================
+# 1. Labels
+# =============================================================================
+_UNIT = {"D": 1 / 365.0, "W": 7 / 365.0, "M": 1 / 12.0, "Y": 1.0}
+_TOK = re.compile(r"(\d+(?:\.\d+)?)([DWMY])")
+_PILLAR = re.compile(r"^\s*((?:\d+(?:\.\d+)?[DWMY])+)\s*X\s*(\d+(?:\.\d+)?Y)\s*$")
+
+
+def to_years(label: str) -> float:
+    """'3M' -> 0.25, '18M' -> 1.5, '1Y6M' -> 1.5."""
+    lab = label.strip().upper()
+    toks = _TOK.findall(lab)
+    if not toks or "".join(n + u for n, u in toks) != lab:
+        raise ValueError(f"bad tenor label: {label!r}")
+    return sum(float(n) * _UNIT[u] for n, u in toks)
+
+
+def fmt_years(y: float) -> str:
+    """0.25 -> '3M', 1.0 -> '1Y', 1.5 -> '18M'."""
+    m = round(y * 12)
+    if abs(m - y * 12) < 1e-6 and m > 0:
+        return f"{m // 12}Y" if m % 12 == 0 else f"{m}M"
+    return f"{y:.4g}Y"
+
+
+@dataclass(frozen=True)
+class FvaPoint:
+    start: float   # forward start S in years (strike fixing date)
+    expiry: float  # option expiry after the start, E in years
+    tenor: str     # swap tenor label, e.g. '10Y'
+
+    @classmethod
+    def parse(cls, label: str) -> "FvaPoint":
+        parts = label.strip().upper().split("X")
+        if len(parts) != 3:
+            raise ValueError(f"FVA point must look like 1Yx1Yx10Y, got {label!r}")
+        return cls(to_years(parts[0]), to_years(parts[1]), parts[2])
+
+    @property
+    def name(self) -> str:
+        return f"{fmt_years(self.start)}x{fmt_years(self.expiry)}x{self.tenor}"
+
+    @property
+    def h_fix(self) -> int:
+        return max(1, round(self.start * TD))
+
+
+# =============================================================================
+# 2. Surface: spot vols, calendar forward vols, marks, midcurves, rates
+# =============================================================================
+def _tv(ts: np.ndarray, row: np.ndarray, T: float) -> float:
+    """Total variance at T for one date (pillar vols `row`): linear in T, flat vol outside."""
+    if T <= 0:
+        return 0.0
+    if T <= ts[0]:
+        return float(row[0] ** 2 * T)
+    if T >= ts[-1]:
+        return float(row[-1] ** 2 * T)
+    return float(np.interp(T, ts, row ** 2 * ts))
+
+
+class VolSurface:
+    """Daily ATM normal vol term structures (one per swap tenor) + optional FVA marks,
+    midcurve vols and swap rates."""
+
+    def __init__(self, df: pd.DataFrame, rate_units: str = "pct"):
+        df = df.copy()
+        df.index = pd.to_datetime(df.index)
+        df = df.sort_index()
+        self.raw, self.index = df, df.index
+        self.rate_mult = 100.0 if rate_units == "pct" else 1.0
+        grid: dict[str, dict[float, str]] = {}
+        self.fva_marks: dict[str, pd.Series] = {}
+        self.midcurves: dict[str, pd.Series] = {}
+        self.rates: dict[str, pd.Series] = {}
+        for c in df.columns:
+            u = str(c).strip().upper()
+            if u.startswith("FVA_") or u.startswith("MC_"):
+                pre = "FVA_" if u.startswith("FVA_") else "MC_"
+                try:
+                    p = FvaPoint.parse(u[len(pre):])
+                except ValueError:
+                    continue
+                (self.fva_marks if pre == "FVA_" else self.midcurves)[p.name] = df[c].astype(float)
+            elif u.startswith("SWAP_"):
+                self.rates[u[5:]] = df[c].astype(float)
+            else:
+                m = _PILLAR.match(u)
+                if m:
+                    grid.setdefault(m.group(2), {})[to_years(m.group(1))] = c
+        self.terms: dict[str, pd.DataFrame] = {}
+        for n, cols in grid.items():
+            ts = sorted(cols)
+            t = df[[cols[T] for T in ts]].astype(float)
+            t.columns = ts
+            self.terms[n] = t
+        if not self.terms:
+            raise ValueError("no '<expiry>x<tenor>' vol columns found (e.g. '1Yx10Y')")
+
+    def total_var(self, T: float, tenor: str) -> pd.Series:
+        """Total variance w(T) = sigma(T)^2 T, linear in T between pillars, flat vol outside."""
+        t = self.terms[tenor]
+        ts, v = np.asarray(t.columns, float), t.to_numpy()
+        if T <= 0:
+            w = np.zeros(len(t))
+        elif T <= ts[0]:
+            w = v[:, 0] ** 2 * T
+        elif T >= ts[-1]:
+            w = v[:, -1] ** 2 * T
+        else:
+            j = int(np.searchsorted(ts, T))
+            t0, t1 = ts[j - 1], ts[j]
+            w0, w1 = v[:, j - 1] ** 2 * t0, v[:, j] ** 2 * t1
+            w = w0 + (T - t0) / (t1 - t0) * (w1 - w0)
+        return pd.Series(w, index=t.index)
+
+    def spot(self, T: float, tenor: str) -> pd.Series:
+        if T <= 0:
+            raise ValueError("expiry must be > 0")
+        return np.sqrt(self.total_var(T, tenor) / T)
+
+    def cal_forward(self, s: float, e: float, tenor: str) -> pd.Series:
+        """Fixed-tenor calendar forward vol. NaN where forward variance <= 0 (calendar arb)."""
+        if s <= 1e-12:
+            return self.spot(e, tenor)
+        fv = (self.total_var(s + e, tenor) - self.total_var(s, tenor)) / e
+        return np.sqrt(fv.where(fv > 0))
+
+    def forward_level(self, p: FvaPoint, source: str = "auto") -> tuple[pd.Series, str]:
+        """Traded forward-vol level: FVA marks > midcurve-exact forward > calendar forward."""
+        if source in ("auto", "marks") and p.name in self.fva_marks:
+            return self.fva_marks[p.name], "marks"
+        if source in ("auto", "midcurve") and p.name in self.midcurves:
+            fv = (self.total_var(p.start + p.expiry, p.tenor) - self.midcurves[p.name] ** 2 * p.start) / p.expiry
+            return np.sqrt(fv.where(fv > 0)), "midcurve"
+        if source in ("marks", "midcurve"):
+            raise KeyError(f"no {source} column for {p.name}")
+        return self.cal_forward(p.start, p.expiry, p.tenor), "calendar"
+
+    def rate_bp_changes(self, tenor: str) -> pd.Series | None:
+        r = self.rates.get(tenor)
+        return None if r is None else r.diff() * self.rate_mult
+
+    def arrays(self, tenor: str) -> tuple[np.ndarray, np.ndarray]:
+        """(pillar expiries, vols matrix) for fast day-by-day marking in the event engines."""
+        if not hasattr(self, "_arr"):
+            self._arr = {}
+        if tenor not in self._arr:
+            t = self.terms[tenor]
+            self._arr[tenor] = (np.asarray(t.columns, float), t.to_numpy())
+        return self._arr[tenor]
+
+
+def _mark(ts: np.ndarray, row: np.ndarray, s_rem: float, e: float, basis: float) -> float:
+    """Mark of an FVA with s_rem years left to fixing (calendar forward + marks basis).
+    At fixing it is the spot ExN straddle vol (the basis no longer applies)."""
+    if not np.all(np.isfinite(row)):
+        return np.nan
+    if s_rem > 1e-9:
+        fv = (_tv(ts, row, s_rem + e) - _tv(ts, row, s_rem)) / e
+        return math.sqrt(max(fv, 0.0)) + basis
+    return math.sqrt(_tv(ts, row, e) / e)
+
+
+# =============================================================================
+# 3. Statistics helpers
+# =============================================================================
+def rolling_ols(y: pd.Series, x: pd.Series, window: int | None, min_periods: int | None = None) -> pd.DataFrame:
+    """OLS y = a + b x on the trailing `window` jointly observed points ending at t
+    (window=None -> expanding window)."""
+    d = pd.concat({"y": y, "x": x}, axis=1)
+    ok = d.dropna()
+    if window is None:
+        mp = min_periods or TD
+        rx, ry = ok["x"].expanding(min_periods=mp), ok["y"].expanding(min_periods=mp)
+    else:
+        mp = min_periods or max(10, int(window * 0.8))
+        rx, ry = ok["x"].rolling(window, min_periods=mp), ok["y"].rolling(window, min_periods=mp)
+    vx, vy = rx.var(), ry.var()
+    cxy = rx.cov(ok["y"])
+    n = rx.count()
+    beta = cxy / vx
+    alpha = ry.mean() - beta * rx.mean()
+    r2 = (cxy ** 2 / (vx * vy)).clip(0, 1)
+    resid_sd = np.sqrt((vy * (1 - r2) * (n - 1) / (n - 2)).clip(lower=0))
+    out = pd.DataFrame({"alpha": alpha, "beta": beta, "r2": r2, "resid_sd": resid_sd, "n": n})
+    return out.reindex(d.index).ffill(limit=5)
+
+
+def zscore(x: pd.Series, window: int, min_frac: float = 0.5) -> pd.Series:
+    """z-score of today's value vs the trailing window that ENDS YESTERDAY (no look-ahead)."""
+    mp = max(20, int(window * min_frac))
+    r = x.rolling(window, min_periods=mp)
+    return (x - r.mean().shift(1)) / r.std().shift(1)
+
+
+def ols_nw(y, X, lags: int) -> dict:
+    """OLS with a constant and Newey-West (Bartlett) standard errors."""
+    d = pd.concat([pd.Series(y, name="y")] + [pd.Series(c) for c in (X if isinstance(X, list) else [X])],
+                  axis=1).dropna()
+    yy = d.iloc[:, 0].to_numpy(float)
+    xx = np.column_stack([np.ones(len(d)), d.iloc[:, 1:].to_numpy(float)])
+    n, k = xx.shape
+    if n <= k + 2:
+        return {"coef": np.full(k, np.nan), "se": np.full(k, np.nan), "t": np.full(k, np.nan), "r2": np.nan, "n": n}
+    xtx_inv = np.linalg.inv(xx.T @ xx)
+    b = xtx_inv @ xx.T @ yy
+    u = yy - xx @ b
+    xu = xx * u[:, None]
+    s = xu.T @ xu
+    for lag in range(1, min(lags, n - 1) + 1):
+        g = xu[lag:].T @ xu[:-lag]
+        s += (1 - lag / (lags + 1)) * (g + g.T)
+    se = np.sqrt(np.clip(np.diag(xtx_inv @ s @ xtx_inv), 0, None))
+    r2 = 1 - (u @ u) / ((yy - yy.mean()) @ (yy - yy.mean()))
+    return {"coef": b, "se": se, "t": b / se, "r2": r2, "n": n}
+
+
+def nw_tstat_mean(x: np.ndarray, lags: int) -> float:
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) < 10:
+        return np.nan
+    u = x - x.mean()
+    s = u @ u
+    for lag in range(1, min(lags, len(u) - 1) + 1):
+        s += 2 * (1 - lag / (lags + 1)) * (u[lag:] @ u[:-lag])
+    return x.mean() / math.sqrt(s) * len(x) if s > 0 else np.nan
+
+
+def implied_mean_reversion(alpha, beta, s: float):
+    """Read sigma_F = alpha + beta sigma_S as an OU vol: beta = exp(-kappa s), theta = alpha/(1-beta)."""
+    b = beta.where((beta > 0) & (beta < 1))
+    kappa = -np.log(b) / s
+    theta = alpha / (1 - b)
+    return kappa, theta, np.log(2) / kappa
+
+
+def realized_persistence(spot: pd.Series, h: int, window: int | None, min_periods: int | None = None) -> pd.Series:
+    """Slope of sigma_S(t+h) on sigma_S(t), usable at t (only pairs whose outcome is observed)."""
+    est = rolling_ols(spot.shift(-h), spot, window, min_periods)["beta"]
+    return est.shift(h)
+
+
+def volvol(spot: pd.Series, window: int = 63) -> pd.Series:
+    """Annualized realized vol of log changes of the vol itself (P-measure vol-of-vol)."""
+    return np.log(spot).diff().rolling(window, min_periods=window // 2).std() * math.sqrt(TD)
+
+
+def fva_convexity_gap(fwd: pd.Series, eta: pd.Series, s: float, k: float = 0.5) -> pd.Series:
+    """Jensen gap between a variance-additive forward vol and an FVA (linear in vol):
+    FVA ~ fwd * exp(-k eta^2 s). k = 0.5 for a true forward-variance level; smaller when the
+    calendar is built from ATM vols (themselves closer to vol-swap levels). Calibrate k on your
+    own FVA marks with `convexity_check`."""
+    return fwd * (1 - np.exp(-k * eta ** 2 * s))
+
+
+# =============================================================================
+# 4. Configuration, signals and P&L legs
+# =============================================================================
+@dataclass
+class Config:
+    win_beta: int = 252        # rolling window for the levels and changes regressions
+    win_z: int = 504           # trailing window for z-scores (carry, beta, level)
+    win_persist: int | None = None  # Stein test window; None = expanding (it needs a LONG sample)
+    persist_min_obs: int = 6   # min independent horizons before the Stein estimate is used
+    diff_lag: int = 5          # changes regression on k-day changes (5 = weekly, less mark noise)
+    hold_days: int = 21        # tranche horizon for the RV / spread signals
+    z_in: float = 1.5          # residual z entry
+    z_out: float = 0.25        # residual z exit (event engine)
+    max_hold: int = 63         # event engine max holding period (business days)
+    beta_z_max: float = 1.5    # hedge-ratio stability filter for the residual trade
+    carry_z_thr: float = 1.0
+    beta_z_thr: float = 1.5
+    stein_thr: float = 0.05
+    theta_window: int = 756    # long-run mean of spot vol (direction of Stein / beta fades)
+    w_carry: float = 0.5       # carry weight in the composite score
+    score_thr: float = 1.0
+    ctr_thr: float = 0.10      # FVA carry-to-risk entry: roll over hold_days / h-day vol of the forward
+    ctr_exit: float = 0.0      # FVA carry-to-risk exit (0 = exit when the carry changes sign)
+    min_hold: int = 5          # event engines: no signal exit before this many business days
+    fva_score_thr: float = 1.0 # FVA carry + value composite entry (exit at z_out)
+    w_value: float = 1.0       # weight of the regression residual (value) in the FVA composite
+    cost_fva_bp: float = 1.5   # round-trip cost in vol bp - PLACEHOLDER, use desk bid/offer
+    cost_spot_bp: float = 1.0  # round-trip cost in vol bp - PLACEHOLDER
+    rv_window: int = 21        # realized-vol window for the VRP signal
+    source: str = "auto"       # 'auto' | 'marks' | 'midcurve' | 'calendar'
+
+
+def build_signals(surf: VolSurface, p: FvaPoint, cfg: Config) -> tuple[pd.DataFrame, str]:
+    F, src = surf.forward_level(p, cfg.source)
+    S = surf.spot(p.expiry, p.tenor)
+    calF = surf.cal_forward(p.start, p.expiry, p.tenor)
+    g = pd.DataFrame(index=surf.index)
+    g.attrs["start"] = p.start
+    g["fwd"], g["spot"], g["cal_fwd"] = F, S, calF
+    g["basis_vs_cal"] = (F - calF) if src != "calendar" else 0.0
+    g["ratio"] = F / S - 1                       # your sigma_FVA / sigma_spot - 1
+    g["carry"] = S - F                           # long-FVA carry to fixing (surface unchanged), bp
+    s_roll = p.start - cfg.hold_days / TD
+    f_roll = surf.cal_forward(s_roll, p.expiry, p.tenor) + g["basis_vs_cal"] if s_roll > 1e-9 else S
+    g["roll_h"] = f_roll - F                     # long-FVA roll over hold_days on today's surface
+    # levels regression: market-implied mean reversion; residual with yesterday's parameters
+    lev = rolling_ols(F, S, cfg.win_beta)
+    levp = lev.shift(1)
+    g["alpha_lvl"], g["beta_lvl"], g["r2_lvl"] = lev["alpha"], lev["beta"], lev["r2"]
+    g["resid"] = F - (levp["alpha"] + levp["beta"] * S)
+    g["resid_z"] = g["resid"] / levp["resid_sd"]
+    kap, theta, hl = implied_mean_reversion(lev["alpha"], lev["beta"], p.start)
+    g["kappa_impl"], g["theta_impl"], g["halflife_impl"] = kap, theta, hl
+    g["beta_lvl_z"] = zscore(lev["beta"], cfg.win_z)      # unusual implied persistence vs own history
+    # changes regression: short-horizon hedge ratio and its stability (NOT a persistence measure:
+    # with several vol factors, k-day changes are dominated by the fast factor)
+    k = cfg.diff_lag
+    chg = rolling_ols(F.diff(k), S.diff(k), cfg.win_beta)
+    g["beta_chg"] = chg["beta"]
+    g["beta_chg_z"] = zscore(chg["beta"], cfg.win_z)
+    # Stein / EH comparison, both in levels and on the same window. With no premium and rational
+    # forecasts sigma_F(t) = E_t[sigma_S(t+h)], so the projection of sigma_F on sigma_S equals the
+    # projection of sigma_S(t+h) on sigma_S(t), whatever the number of factors.
+    mp = max(2 * TD, cfg.persist_min_obs * p.h_fix)
+    g["beta_lvl_long"] = rolling_ols(F, S, cfg.win_persist, mp)["beta"]
+    g["beta_real"] = realized_persistence(S, p.h_fix, cfg.win_persist, mp)
+    g["stein_gap"] = g["beta_lvl_long"] - g["beta_real"]   # > 0: forward over-reacts to spot
+    g["theta_p"] = S.rolling(cfg.theta_window, min_periods=cfg.theta_window // 2).mean()
+    g["carry_z"] = zscore(g["carry"], cfg.win_z)
+    g["level_z"] = zscore(S, cfg.win_z)
+    g["spread"] = F - g["beta_chg"] * S
+    g["volvol"] = volvol(S)
+    # FVA-only carry: the roll along the forward-vol curve over hold_days (surface unchanged),
+    # per unit of the forward's own h-day vol = a carry "Sharpe"; composite with the residual (value)
+    hd = cfg.hold_days
+    g["fwd_risk_h"] = F.diff(hd).rolling(cfg.win_beta, min_periods=cfg.win_beta // 2).std()
+    g["ctr"] = g["roll_h"] / g["fwd_risk_h"]
+    g["ctr_z"] = zscore(g["ctr"], cfg.win_z)
+    g["fva_score"] = g["ctr_z"] - cfg.w_value * g["resid_z"]
+    dr = surf.rate_bp_changes(p.tenor)
+    if dr is not None:
+        g["rv"] = np.sqrt(TD * (dr ** 2).rolling(cfg.rv_window, min_periods=cfg.rv_window // 2).mean())
+        g["vrp"] = S - g["rv"]
+    return g, src
+
+
+def leg_pnls(surf: VolSurface, p: FvaPoint, cfg: Config, g: pd.DataFrame) -> pd.DataFrame:
+    """Forward-looking P&L of the legs at fixed horizons (evaluation only, never a signal)."""
+    h, h_fix = cfg.hold_days, p.h_fix
+    F, S = g["fwd"], g["spot"]
+    out = pd.DataFrame(index=g.index)
+    out["fix"] = S.shift(-h_fix) - F              # long FVA held to fixing, settled vs spot vol then
+    if h < h_fix:
+        exit_lvl = surf.cal_forward(p.start - h / TD, p.expiry, p.tenor) + g["basis_vs_cal"]
+        out["mtm"] = exit_lvl.shift(-h) - F       # long FVA marked after h days (forward start rolls down)
+    else:
+        out["mtm"] = out["fix"]
+    if p.expiry > h / TD + 1e-9:                  # long spot straddle held h days: vega roll + gamma/theta
+        out["spot_vega"] = surf.spot(p.expiry - h / TD, p.tenor).shift(-h) - S
+        dr = surf.rate_bp_changes(p.tenor)
+        if dr is not None:
+            rv_fwd = np.sqrt(TD / h * (dr ** 2).rolling(h).sum().shift(-h))
+            out["spot_gamma"] = (rv_fwd ** 2 - S ** 2) * (h / TD) / (2 * S * p.expiry)
+        else:
+            out["spot_gamma"] = 0.0
+        out["spot_leg"] = out["spot_vega"] + out["spot_gamma"]
+    else:
+        out["spot_vega"] = out["spot_gamma"] = out["spot_leg"] = np.nan
+    return out
+
+
+# =============================================================================
+# 5. Strategy rules
+# =============================================================================
+def _sgn(x: pd.Series, cond: pd.Series) -> pd.Series:
+    return np.sign(x).where(cond, 0.0).where(x.notna())
+
+
+def _rule_stein(g, c):
+    """Over-reaction (implied persistence > realized): fade spot's deviation from its long-run
+    mean in the forward; under-reaction: lean with it."""
+    dev = np.sign(g["spot"] - g["theta_p"])
+    pos = pd.Series(0.0, index=g.index)
+    pos = pos.where(~(g["stein_gap"] > c.stein_thr), -dev)
+    pos = pos.where(~(g["stein_gap"] < -c.stein_thr), dev)
+    return pos.where(g["stein_gap"].notna() & g["theta_p"].notna())
+
+
+def _rule_beta_z(g, c):
+    """'z-score the beta': implied persistence (levels beta) unusually high vs its own history ->
+    forward vol over-reacting -> fade the spot deviation; unusually low -> lean with it."""
+    z = g["beta_lvl_z"]
+    dev = np.sign(g["spot"] - g["theta_p"])
+    pos = pd.Series(0.0, index=g.index)
+    pos = pos.where(~(z > c.beta_z_thr), -dev)
+    pos = pos.where(~(z < -c.beta_z_thr), dev)
+    return pos.where(z.notna() & g["theta_p"].notna())
+
+
+def _score(g, c):
+    return -g["resid_z"] + c.w_carry * g["carry_z"]
+
+
+# Tranche strategies: name -> (kind, mode, rule). kind 'outright' = FVA alone; 'spread' = FVA - beta x spot
+TRANCHE: dict[str, tuple[str, str, Callable]] = {
+    "short_fva_fix":       ("outright", "fix", lambda g, c: pd.Series(-1.0, index=g.index)),
+    "long_fva_fix":        ("outright", "fix", lambda g, c: pd.Series(1.0, index=g.index)),
+    "carry_z_fix":         ("outright", "fix", lambda g, c: _sgn(g["carry_z"], g["carry_z"].abs() > c.carry_z_thr)),
+    "stein_fade_fix":      ("outright", "fix", _rule_stein),
+    "beta_z_fade_fix":     ("outright", "fix", _rule_beta_z),
+    "resid_mr":            ("spread", "mtm", lambda g, c: _sgn(-g["resid_z"], g["resid_z"].abs() > c.z_in)),
+    "resid_mr_betafilter": ("spread", "mtm", lambda g, c: _sgn(-g["resid_z"], (g["resid_z"].abs() > c.z_in)
+                                                                & (g["beta_chg_z"].abs() < c.beta_z_max))),
+    "resid_plus_carry":    ("spread", "mtm", lambda g, c: _sgn(_score(g, c), _score(g, c).abs() > c.score_thr)),
+    "long_fwd_short_spot": ("spread", "mtm", lambda g, c: pd.Series(1.0, index=g.index)),
+    "vrp_timed_spread":    ("spread", "mtm", lambda g, c: (g["vrp"] > 0).astype(float).where(g["vrp"].notna())),
+    # FVA only (no swaption leg): carry along the forward-vol curve, alone and with the residual
+    "fva_carry_mtm":       ("outright", "mtm", lambda g, c: _sgn(g["ctr"], g["ctr"].abs() > c.ctr_thr)),
+    "fva_carry_value_mtm": ("outright", "mtm", lambda g, c: _sgn(g["fva_score"],
+                                                                 g["fva_score"].abs() > c.fva_score_thr)),
+}
+
+# Event strategies: name -> (hedged, entry rule, hold rule, max-hold rule). hold != entry sign -> exit.
+EVENT: dict[str, tuple[bool, Callable, Callable, Callable]] = {
+    "ev_resid_mr": (True,
+                    lambda g, c: _sgn(-g["resid_z"], g["resid_z"].abs() > c.z_in),
+                    lambda g, c: _sgn(-g["resid_z"], g["resid_z"].abs() > c.z_out),
+                    lambda p, c: c.max_hold),
+    "ev_resid_mr_betafilter": (True,
+                               lambda g, c: _sgn(-g["resid_z"], (g["resid_z"].abs() > c.z_in)
+                                                 & (g["beta_chg_z"].abs() < c.beta_z_max)),
+                               lambda g, c: _sgn(-g["resid_z"], g["resid_z"].abs() > c.z_out),
+                               lambda p, c: c.max_hold),
+    "ev_resid_plus_carry": (True,
+                            lambda g, c: _sgn(_score(g, c), _score(g, c).abs() > c.score_thr),
+                            lambda g, c: _sgn(_score(g, c), _score(g, c).abs() > c.z_out),
+                            lambda p, c: c.max_hold),
+    "ev_long_fwd_short_spot": (True,
+                               lambda g, c: pd.Series(1.0, index=g.index),
+                               lambda g, c: pd.Series(1.0, index=g.index),
+                               lambda p, c: min(p.h_fix, round(p.expiry * TD) - 1)),
+    "ev_carry_z_to_fixing": (False,
+                             lambda g, c: _sgn(g["carry_z"], g["carry_z"].abs() > c.carry_z_thr),
+                             lambda g, c: _sgn(g["carry_z"], g["carry_z"].abs() > 0),
+                             lambda p, c: p.h_fix),
+    "ev_stein_fade_to_fixing": (False, _rule_stein, _rule_stein, lambda p, c: p.h_fix),
+    "ev_long_fva_to_fixing": (False,
+                              lambda g, c: pd.Series(1.0, index=g.index),
+                              lambda g, c: pd.Series(1.0, index=g.index),
+                              lambda p, c: p.h_fix),
+    # FVA only. Carry: in while carry-to-risk clears ctr_thr, out below ctr_exit, at most to fixing
+    "ev_fva_carry": (False,
+                     lambda g, c: _sgn(g["ctr"], g["ctr"].abs() > c.ctr_thr),
+                     lambda g, c: _sgn(g["ctr"], g["ctr"].abs() > c.ctr_exit),
+                     lambda p, c: p.h_fix),
+    # Carry + value: score = z(carry-to-risk) - residual z; in beyond +-1, out inside +-z_out
+    "ev_fva_carry_value": (False,
+                           lambda g, c: _sgn(g["fva_score"], g["fva_score"].abs() > c.fva_score_thr),
+                           lambda g, c: _sgn(g["fva_score"], g["fva_score"].abs() > c.z_out),
+                           lambda p, c: c.max_hold),
+}
+
+CORE = ["resid_z", "beta_chg_z", "carry_z"]  # common evaluation sample = where these exist
+
+
+# =============================================================================
+# 6. Engines
+# =============================================================================
+def tranche_pnl(name: str, g: pd.DataFrame, legs: pd.DataFrame, cfg: Config):
+    kind, mode, rule = TRANCHE[name]
+    valid = g[CORE].notna().all(axis=1)
+    pos = rule(g, cfg).where(valid).fillna(0.0).where(valid)
+    h = max(1, round(g.attrs["start"] * TD)) if mode == "fix" else cfg.hold_days
+    if kind == "outright":
+        gross = pos * legs[mode]
+        cost = pos.abs() * cfg.cost_fva_bp
+    else:
+        b = g["beta_chg"]
+        gross = pos * (legs["mtm"] - b * legs["spot_leg"])
+        cost = pos.abs() * (cfg.cost_fva_bp + b.abs() * cfg.cost_spot_bp)
+    return (gross - cost).where(valid), gross.where(valid), pos, h
+
+
+def _sharpe(x: pd.Series, h: int) -> float:
+    x = x.dropna()
+    return np.nan if len(x) < 8 or x.std() == 0 else x.mean() / x.std() * math.sqrt(TD / h)
+
+
+def tranche_perf(net: pd.Series, gross: pd.Series, pos: pd.Series, h: int) -> dict:
+    x = net.dropna()
+    if len(x) < 3 * h:
+        return {"days": len(x)}
+    on = pos.reindex(x.index) != 0
+    act, gact = x[on], gross.reindex(x.index)[on]
+    shs = [v for v in (_sharpe(x.iloc[k::h], h) for k in range(h)) if np.isfinite(v)]
+    path = x.iloc[0::h].cumsum()
+    return {
+        "days": len(x),
+        "active%": 100 * on.mean(),
+        "gross_bp_trade": gact.mean() if len(act) else np.nan,
+        "net_bp_trade": act.mean() if len(act) else np.nan,
+        "hit%": 100 * (act > 0).mean() if len(act) else np.nan,
+        "bp_per_yr": x.mean() * TD / h,
+        "sharpe": float(np.mean(shs)) if shs else np.nan,
+        "t_nw": nw_tstat_mean(x.to_numpy(), h),
+        "worst_bp": act.min() if len(act) else np.nan,
+        "skew": act.skew() if len(act) > 10 else np.nan,
+        "max_dd_bp": (path.cummax() - path).max(),
+    }
+
+
+def event_backtest(surf: VolSurface, p: FvaPoint, cfg: Config, g: pd.DataFrame,
+                   entry: pd.Series, hold: pd.Series, hedged: bool, max_hold: int):
+    """One trade at a time. Daily MTM: the FVA is re-marked at its shrinking forward start
+    (roll-down), becomes the spot straddle at fixing; the spot hedge (beta fixed at entry) is
+    re-marked at its shrinking expiry plus delta-hedged gamma/theta from realized rate moves."""
+    ts, V = surf.arrays(p.tenor)
+    F, S, B = g["fwd"].to_numpy(), g["spot"].to_numpy(), g["beta_chg"].to_numpy()
+    basis = g["basis_vs_cal"].to_numpy() if not np.isscalar(g["basis_vs_cal"]) else np.zeros(len(g))
+    dr = surf.rate_bp_changes(p.tenor)
+    dr2 = (dr ** 2).to_numpy() if dr is not None else None
+    ent, hld = entry.to_numpy(), hold.to_numpy()
+    valid = g[CORE].notna().all(axis=1).to_numpy()
+    if hedged:
+        max_hold = min(max_hold, round(p.expiry * TD) - 1)
+    max_hold = max(1, min(max_hold, p.h_fix))
+    n = len(g)
+    daily = np.zeros(n)
+    trades = []
+    i = 0
+    while i < n - 1:
+        d0 = ent[i]
+        if (not valid[i]) or d0 not in (1.0, -1.0) or not np.isfinite(F[i]) or not np.isfinite(S[i]) \
+                or (hedged and not np.isfinite(B[i])):
+            i += 1
+            continue
+        b0 = B[i] if hedged else 0.0
+        cost = cfg.cost_fva_bp + (abs(b0) * cfg.cost_spot_bp if hedged else 0.0)
+        daily[i] -= cost
+        prev, gam, j, reason = 0.0, 0.0, i, "end"
+        while j < n - 1:
+            j += 1
+            tau = (j - i) / TD
+            s_rem = p.start - tau
+            row = V[j]
+            if not np.all(np.isfinite(row)):
+                continue                                   # missing day: carry the last mark
+            val = _mark(ts, row, s_rem, p.expiry, basis[j]) - F[i]   # rolls down; spot straddle at fixing
+            if hedged:
+                e_rem = p.expiry - tau
+                sv = math.sqrt(_tv(ts, row, e_rem) / e_rem)
+                if dr2 is not None and np.isfinite(dr2[j]):
+                    gam += (dr2[j] - S[i] ** 2 / TD) / (2 * S[i] * p.expiry)
+                val -= b0 * ((sv - S[i]) + gam)
+            val *= d0
+            daily[j] += val - prev
+            prev = val
+            if s_rem <= 1e-9:
+                reason = "fixing"
+                break
+            if j - i >= max_hold:
+                reason = "time"
+                break
+            if j - i >= cfg.min_hold and np.isfinite(hld[j]) and hld[j] != d0:
+                reason = "signal"
+                break
+        trades.append({"entry": g.index[i], "exit": g.index[j], "dir": d0, "days": j - i, "beta": b0,
+                       "gross_bp": prev, "net_bp": prev - cost, "reason": reason})
+        i = j + 1
+    tr = pd.DataFrame(trades)
+    first = np.argmax(valid) if valid.any() else n
+    return tr, pd.Series(daily, index=g.index).iloc[first:]
+
+
+def event_perf(tr: pd.DataFrame, daily: pd.Series) -> dict:
+    if daily.empty:
+        return {"trades": 0}
+    yrs = len(daily) / TD
+    out = {"trades": len(tr), "trades_per_yr": len(tr) / yrs if yrs > 0 else np.nan}
+    if len(tr):
+        out |= {"avg_hold_d": tr["days"].mean(), "gross_bp_trade": tr["gross_bp"].mean(),
+                "net_bp_trade": tr["net_bp"].mean(), "hit%": 100 * (tr["net_bp"] > 0).mean(),
+                "worst_trade_bp": tr["net_bp"].min()}
+    cum = daily.cumsum()
+    sd = daily.std()
+    out |= {"bp_per_yr": daily.sum() / yrs if yrs > 0 else np.nan,
+            "sharpe": daily.mean() / sd * math.sqrt(TD) if sd > 0 else np.nan,
+            "t_nw": nw_tstat_mean(daily.to_numpy(), 21),
+            "max_dd_bp": (cum.cummax() - cum).max()}
+    return out
+
+
+# =============================================================================
+# 7. Point-level runner, diagnostics, scanner, snapshot
+# =============================================================================
+@dataclass
+class PointResult:
+    point: FvaPoint
+    source: str
+    signals: pd.DataFrame
+    legs: pd.DataFrame
+    tranche: dict      # name -> (net, gross, pos, h)
+    events: dict       # name -> (trades, daily, entry)
+    stats: pd.DataFrame
+    ev_stats: pd.DataFrame
+    diag: dict
+
+
+def diagnostics(g: pd.DataFrame, legs: pd.DataFrame, p: FvaPoint, cfg: Config) -> dict:
+    h, k = p.h_fix, cfg.diff_lag
+    eh = ols_nw(g["spot"].shift(-h) - g["spot"], g["fwd"] - g["spot"], lags=h)   # b = 1 under EH
+    pc = ols_nw(legs["fix"], g["carry"], lags=h)                                # slope = 1 - b
+    ar = ols_nw(g["spot"].shift(-h), g["spot"], lags=h)                         # realized persistence
+    lv = ols_nw(g["fwd"], g["spot"], lags=21)                                   # implied persistence
+    ch = ols_nw(g["fwd"].diff(k), g["spot"].diff(k), lags=2 * k)                # hedge ratio
+    rp = ols_nw(legs["mtm"], g["roll_h"], lags=cfg.hold_days)                   # roll pass-through
+    return {
+        "mean_ratio_%": 100 * g["ratio"].mean(),
+        "pct_days_fwd<spot": 100 * (g["ratio"] < 0).mean(),
+        "mean_carry_bp": g["carry"].mean(),
+        "beta_levels": lv["coef"][1],
+        "beta_realized_h": ar["coef"][1],
+        "se_beta_realized": ar["se"][1],
+        "stein_gap": lv["coef"][1] - ar["coef"][1],
+        "beta_changes(hedge)": ch["coef"][1],
+        "kappa_implied": -math.log(lv["coef"][1]) / p.start if 0 < lv["coef"][1] < 1 else np.nan,
+        "kappa_realized": -math.log(ar["coef"][1]) / p.start if 0 < ar["coef"][1] < 1 else np.nan,
+        "EH_a_bp": eh["coef"][0], "EH_b": eh["coef"][1], "EH_t(b=1)": (eh["coef"][1] - 1) / eh["se"][1],
+        "fix_pnl_mean_bp": legs["fix"].mean(),
+        "carry->pnl_slope": pc["coef"][1], "carry->pnl_t": pc["t"][1],
+        "roll_h_mean_bp": g["roll_h"].mean(),          # structural carry gate: compare these two means
+        "mtm_h_mean_bp": legs["mtm"].mean(),           # what a long FVA actually made over hold_days
+        "mean_carry_to_risk": g["ctr"].mean(),
+        "roll->mtm_slope": rp["coef"][1], "roll->mtm_t": rp["t"][1],   # timing gate: 1 = earned, 0 = EH
+        "n_independent": round(eh["n"] / h, 1),
+    }
+
+
+def convexity_check(g: pd.DataFrame, s: float) -> dict:
+    """If FVA marks exist: does (marks / calendar fwd - 1) load on -vol-of-vol^2 x s ?"""
+    if np.isscalar(g["basis_vs_cal"]) or (g["basis_vs_cal"].fillna(0) == 0).all():
+        return {}
+    y = g["fwd"] / g["cal_fwd"] - 1
+    r = ols_nw(y, -(g["volvol"] ** 2) * s, lags=21)
+    return {"conv_k_hat": r["coef"][1], "conv_t": r["t"][1], "conv_r2": r["r2"]}
+
+
+def _blocks(x, split):
+    out = [("all", x)]
+    if split is not None:
+        sd = pd.Timestamp(split)
+        out += [("in", x[x.index < sd]), ("out", x[x.index >= sd])]
+    return out
+
+
+def run_point(surf: VolSurface, p: FvaPoint, cfg: Config, split=None,
+              tranche=None, events=None) -> PointResult:
+    g, src = build_signals(surf, p, cfg)
+    legs = leg_pnls(surf, p, cfg, g)
+    has_rv = "vrp" in g
+    rows, tr_res = [], {}
+    for name in (tranche if tranche is not None else TRANCHE):
+        if name == "vrp_timed_spread" and not has_rv:
+            continue
+        net, gross, pos, h = tranche_pnl(name, g, legs, cfg)
+        tr_res[name] = (net, gross, pos, h)
+        for lab, x in _blocks(net, split):
+            rows.append({"point": p.name, "strategy": name, "sample": lab, "hold_d": h,
+                         **tranche_perf(x, gross, pos, h)})
+    ev_rows, ev_res = [], {}
+    for name in (events if events is not None else EVENT):
+        hedged, ent_rule, hold_rule, mh_rule = EVENT[name]
+        ent, hld = ent_rule(g, cfg), hold_rule(g, cfg)
+        tr, daily = event_backtest(surf, p, cfg, g, ent, hld, hedged, mh_rule(p, cfg))
+        ev_res[name] = (tr, daily, ent)
+        for lab, d in _blocks(daily, split):
+            sub = tr[(tr["entry"] >= d.index[0]) & (tr["entry"] <= d.index[-1])] if len(tr) and len(d) else tr
+            ev_rows.append({"point": p.name, "strategy": name, "sample": lab, **event_perf(sub, d)})
+    diag = diagnostics(g, legs, p, cfg) | convexity_check(g, p.start)
+    return PointResult(p, src, g, legs, tr_res, ev_res, pd.DataFrame(rows), pd.DataFrame(ev_rows), diag)
+
+
+def _rank(st: pd.DataFrame, split, rank_on: str) -> pd.DataFrame:
+    key = "in" if split is not None else "all"
+    rank = st[st["sample"] == key].sort_values(rank_on, ascending=False)
+    if split is not None:
+        oos = st[st["sample"] == "out"].set_index(["point", "strategy"])[["sharpe", "bp_per_yr", "t_nw"]]
+        rank = rank.join(oos, on=["point", "strategy"], rsuffix="_oos")
+    return rank.reset_index(drop=True)
+
+
+def scan(surf: VolSurface, points, cfg: Config, split=None, rank_on: str = "sharpe"):
+    res = {pt.name: run_point(surf, pt, cfg, split=split) for pt in points}
+    tr = _rank(pd.concat([r.stats for r in res.values()], ignore_index=True), split, rank_on)
+    ev = _rank(pd.concat([r.ev_stats for r in res.values()], ignore_index=True), split, rank_on)
+    return tr, ev, res
+
+
+# =============================================================================
+# 7b. FVA only: FVA vs FVA pairs and a cross-sectional carry book (no swaption leg anywhere)
+# =============================================================================
+def build_pair_signals(surf: VolSurface, p1: FvaPoint, p2: FvaPoint, cfg: Config):
+    """Long p1, short beta x p2 (both FVAs). Beta from k-day changes; value = residual of the levels
+    regression F1 on F2 (yesterday's fit); carry = roll1 - beta roll2 over hold_days, per unit of the
+    pair's own h-day vol."""
+    g1, _ = build_signals(surf, p1, cfg)
+    g2, _ = build_signals(surf, p2, cfg)
+    F1, F2 = g1["fwd"], g2["fwd"]
+    k, h, w = cfg.diff_lag, cfg.hold_days, cfg.win_beta
+    gp = pd.DataFrame(index=surf.index)
+    gp["f1"], gp["f2"] = F1, F2
+    gp["beta"] = rolling_ols(F1.diff(k), F2.diff(k), w)["beta"]
+    lev = rolling_ols(F1, F2, w).shift(1)
+    gp["resid_z"] = (F1 - (lev["alpha"] + lev["beta"] * F2)) / lev["resid_sd"]
+    gp["roll"] = g1["roll_h"] - gp["beta"] * g2["roll_h"]
+    d1, d2 = F1.diff(h), F2.diff(h)
+    r1, r2 = d1.rolling(w, min_periods=w // 2), d2.rolling(w, min_periods=w // 2)
+    var = r1.var() + gp["beta"] ** 2 * r2.var() - 2 * gp["beta"] * r1.cov(d2)
+    gp["risk"] = np.sqrt(var.clip(lower=0))
+    gp["ctr"] = gp["roll"] / gp["risk"]
+    gp["ctr_z"] = zscore(gp["ctr"], cfg.win_z)
+    gp["score"] = gp["ctr_z"] - cfg.w_value * gp["resid_z"]
+    l1, l2 = leg_pnls(surf, p1, cfg, g1), leg_pnls(surf, p2, cfg, g2)
+    gp["pair_mtm"] = l1["mtm"] - gp["beta"] * l2["mtm"]       # evaluation only (forward-looking)
+    return gp, g1, g2
+
+
+def pair_event_backtest(surf: VolSurface, p1: FvaPoint, p2: FvaPoint, cfg: Config, gp, g1, g2,
+                        entry: pd.Series, hold: pd.Series, max_hold: int):
+    """One pair trade at a time, both legs re-marked daily along their own forward starts.
+    Exits before the nearer fixing, so the book never holds a straddle."""
+    ts1, V1 = surf.arrays(p1.tenor)
+    ts2, V2 = surf.arrays(p2.tenor)
+    F1, F2, B = gp["f1"].to_numpy(), gp["f2"].to_numpy(), gp["beta"].to_numpy()
+    b1, b2 = g1["basis_vs_cal"].to_numpy(), g2["basis_vs_cal"].to_numpy()
+    ent, hld = entry.to_numpy(), hold.to_numpy()
+    valid = gp[["resid_z", "ctr_z", "beta"]].notna().all(axis=1).to_numpy()
+    max_hold = max(1, min(max_hold, p1.h_fix - 1, p2.h_fix - 1))
+    n = len(gp)
+    daily = np.zeros(n)
+    trades = []
+    i = 0
+    while i < n - 1:
+        d0 = ent[i]
+        if (not valid[i]) or d0 not in (1.0, -1.0) or not (np.isfinite(F1[i]) and np.isfinite(F2[i])):
+            i += 1
+            continue
+        b0 = B[i]
+        cost = cfg.cost_fva_bp * (1 + abs(b0))
+        daily[i] -= cost
+        prev, j, reason = 0.0, i, "end"
+        while j < n - 1:
+            j += 1
+            tau = (j - i) / TD
+            m1 = _mark(ts1, V1[j], p1.start - tau, p1.expiry, b1[j])
+            m2 = _mark(ts2, V2[j], p2.start - tau, p2.expiry, b2[j])
+            if not (np.isfinite(m1) and np.isfinite(m2)):
+                continue
+            val = d0 * ((m1 - F1[i]) - b0 * (m2 - F2[i]))
+            daily[j] += val - prev
+            prev = val
+            if j - i >= max_hold:
+                reason = "time"
+                break
+            if j - i >= cfg.min_hold and np.isfinite(hld[j]) and hld[j] != d0:
+                reason = "signal"
+                break
+        trades.append({"entry": gp.index[i], "exit": gp.index[j], "dir": d0, "days": j - i, "beta": b0,
+                       "gross_bp": prev, "net_bp": prev - cost, "reason": reason})
+        i = j + 1
+    first = np.argmax(valid) if valid.any() else n
+    return pd.DataFrame(trades), pd.Series(daily, index=gp.index).iloc[first:]
+
+
+PAIR_EVENT: dict[str, tuple[Callable, Callable]] = {
+    "pair_carry_value": (lambda gp, c: _sgn(gp["score"], gp["score"].abs() > c.fva_score_thr),
+                         lambda gp, c: _sgn(gp["score"], gp["score"].abs() > c.z_out)),
+    "pair_carry": (lambda gp, c: _sgn(gp["ctr"], gp["ctr"].abs() > c.ctr_thr),
+                   lambda gp, c: _sgn(gp["ctr"], gp["ctr"].abs() > c.ctr_exit)),
+    "pair_value": (lambda gp, c: _sgn(-gp["resid_z"], gp["resid_z"].abs() > c.z_in),
+                   lambda gp, c: _sgn(-gp["resid_z"], gp["resid_z"].abs() > c.z_out)),
+}
+
+
+def run_pair(surf: VolSurface, p1: FvaPoint, p2: FvaPoint, cfg: Config, split=None) -> dict:
+    gp, g1, g2 = build_pair_signals(surf, p1, p2, cfg)
+    name = f"{p1.name} vs {p2.name}"
+    rows, events = [], {}
+    for sname, (er, hr) in PAIR_EVENT.items():
+        ent = er(gp, cfg)
+        tr, daily = pair_event_backtest(surf, p1, p2, cfg, gp, g1, g2, ent, hr(gp, cfg), cfg.max_hold)
+        events[sname] = (tr, daily, ent)
+        for lab, d in _blocks(daily, split):
+            sub = tr[(tr["entry"] >= d.index[0]) & (tr["entry"] <= d.index[-1])] if len(tr) and len(d) else tr
+            rows.append({"point": name, "strategy": sname, "sample": lab, **event_perf(sub, d)})
+    pt = ols_nw(gp["pair_mtm"], gp["roll"], lags=cfg.hold_days)
+    diag = {"pair_beta_mean": gp["beta"].mean(), "pair_roll_mean_bp": gp["roll"].mean(),
+            "pair_roll->mtm_slope": pt["coef"][1], "pair_roll->mtm_t": pt["t"][1]}
+    return {"name": name, "signals": gp, "events": events, "stats": pd.DataFrame(rows), "diag": diag}
+
+
+def scan_pairs(surf: VolSurface, pairs, cfg: Config, split=None, rank_on: str = "sharpe"):
+    res = {}
+    for p1, p2 in pairs:
+        r = run_pair(surf, p1, p2, cfg, split)
+        res[r["name"]] = r
+    st = pd.concat([r["stats"] for r in res.values()], ignore_index=True)
+    return _rank(st, split, rank_on), res
+
+
+def xs_carry(results: dict, cfg: Config, split=None, signal: str = "ctr", min_points: int = 3):
+    """Cross-sectional FVA carry book: each day rank the points on `signal` (carry-to-risk by
+    default), long the top and short the bottom, rank weights demeaned so the book is vega-neutral
+    and scaled to 1 unit of vega long + 1 short. P&L = each point's h-day MTM (roll included).
+    Tranche engine: costs charged per tranche, so persistent ranks overstate turnover."""
+    names = [k for k, r in results.items() if signal in r.signals]
+    sig = pd.DataFrame({k: results[k].signals[signal] for k in names})
+    mtm = pd.DataFrame({k: results[k].legs["mtm"] for k in names})
+    rk = sig.rank(axis=1)
+    w = rk.sub(rk.mean(axis=1), axis=0)
+    w = w.div(w.abs().sum(axis=1), axis=0) * 2.0
+    w = w.where(sig.notna().sum(axis=1) >= min_points)
+    gross = (w * mtm).sum(axis=1, min_count=1).where(w.notna().any(axis=1))
+    turnover = w.abs().sum(axis=1)
+    net = gross - turnover * cfg.cost_fva_bp
+    pos = (turnover > 0).astype(float)
+    h = cfg.hold_days
+    rows = [{"portfolio": f"xs_{signal}", "sample": lab, "hold_d": h, **tranche_perf(x, gross, pos, h)}
+            for lab, x in _blocks(net, split)]
+    return pd.DataFrame(rows), w, net
+
+
+SNAP_COLS = ["fwd", "spot", "ratio", "carry", "roll_h", "fwd_risk_h", "ctr", "ctr_z", "fva_score", "beta_lvl",
+             "beta_lvl_z", "halflife_impl", "theta_impl", "beta_chg", "beta_chg_z", "resid_z", "carry_z",
+             "beta_lvl_long", "beta_real", "stein_gap", "level_z", "vrp"]
+
+
+def snapshot(results: dict, cfg: Config | None = None, date=None) -> pd.DataFrame:
+    """Latest signal values per point + what each event strategy would do today."""
+    cfg = cfg or Config()
+    rows = []
+    for name, r in results.items():
+        g = r.signals.dropna(subset=["fwd", "spot"])
+        d = g.index[-1] if date is None else g.index[g.index <= pd.Timestamp(date)][-1]
+        row = {"point": name, "date": d.date(), "source": r.source}
+        row |= {c: g.at[d, c] for c in SNAP_COLS if c in g}
+        row |= {f"entry:{s}": r.events[s][2].get(d, np.nan) for s in r.events}
+        rows.append(row)
+    return pd.DataFrame(rows).set_index("point")
+
+
+# =============================================================================
+# 8. Synthetic surface (validation only: known mean reversion, premia, noise)
+# =============================================================================
+def simulate(n_years: int = 16, seed: int = 11, tenor: str = "10Y",
+             expiries=("1M", "3M", "6M", "9M", "1Y", "18M", "2Y", "3Y", "5Y"),
+             mu: float = math.log(70.0), kL: float = 0.5, eL: float = 0.30, kY: float = 6.0, eY: float = 0.9,
+             kLQ: float = 0.5, kYQ: float = 3.5, pi_st: float = 0.07, pi_tau: float = 0.5, pi_lt: float = 0.01,
+             noise_sd: float = 0.6, noise_hl: float = 7.0, t_df: float = 5.0, start: str = "2010-01-04"):
+    """Instantaneous normal vol sigma_t = exp(mu + L + Y): slow factor L, fast factor Y (OU under P).
+    Implied vols price E^Q[sigma^2] with slower Q mean reversion of the fast factor (kYQ < kY:
+    Stein-type over-reaction), times a vol premium that is largest at short expiries (pi_st, pi_tau),
+    plus AR(1) mark noise per pillar (transient RV). Swap-rate changes have sigma_t vol, t-tails."""
+    rng = np.random.default_rng(seed)
+    n, dt = n_years * TD, 1.0 / TD
+    aL, aY = math.exp(-kL * dt), math.exp(-kY * dt)
+    sL, sY = eL * math.sqrt((1 - aL ** 2) / (2 * kL)), eY * math.sqrt((1 - aY ** 2) / (2 * kY))
+    zL, zY = rng.standard_normal(n), rng.standard_normal(n)
+    L, Y = np.zeros(n), np.zeros(n)
+    for i in range(1, n):
+        L[i] = aL * L[i - 1] + sL * zL[i]
+        Y[i] = aY * Y[i - 1] + sY * zY[i]
+    sig = np.exp(mu + L + Y)
+    xg, wg = np.polynomial.legendre.leggauss(24)
+    phi = 0.5 ** (1.0 / noise_hl)
+    cols = {}
+    for lab in expiries:
+        T = to_years(lab)
+        u, w = 0.5 * T * (xg + 1), 0.5 * T * wg
+        eLq, eYq = np.exp(-kLQ * u), np.exp(-kYQ * u)
+        m = mu + L[:, None] * eLq + Y[:, None] * eYq
+        v = eL ** 2 / (2 * kLQ) * (1 - eLq ** 2) + eY ** 2 / (2 * kYQ) * (1 - eYq ** 2)
+        var_bar = (np.exp(2 * m + 2 * v) * w).sum(axis=1) / T
+        noise = np.zeros(n)
+        eps = rng.standard_normal(n) * noise_sd * math.sqrt(1 - phi ** 2)
+        for i in range(1, n):
+            noise[i] = phi * noise[i - 1] + eps[i]
+        cols[f"{lab}x{tenor}"] = np.sqrt(var_bar) * (1 + pi_st * math.exp(-T / pi_tau) + pi_lt) + noise
+    tz = rng.standard_t(t_df, n) * math.sqrt((t_df - 2) / t_df)
+    dr_bp = sig * math.sqrt(dt) * tz
+    idx = pd.bdate_range(start, periods=n)
+    df = pd.DataFrame(cols, index=idx)
+    df[f"SWAP_{tenor}"] = 2.5 + np.cumsum(dr_bp) / 100.0
+    truth = {"kappa_fast_P": kY, "kappa_fast_Q": kYQ, "kappa_slow": kL,
+             "premium(T)": "1 + %.2f exp(-T/%.1f) + %.2f" % (pi_st, pi_tau, pi_lt)}
+    return df, truth
+
+
+# =============================================================================
+# 9. Self-tests
+# =============================================================================
+def selftest(verbose: bool = True) -> None:
+    def ok(cond, msg):
+        if not cond:
+            raise AssertionError(msg)
+
+    # labels
+    for lab, y in [("3M", .25), ("18M", 1.5), ("1Y6M", 1.5), ("10Y", 10.0)]:
+        ok(abs(to_years(lab) - y) < 1e-12, f"to_years {lab}")
+    ok(FvaPoint.parse("6mx6mx10y").name == "6Mx6Mx10Y", "point parse")
+    idx = pd.bdate_range("2020-01-01", periods=300)
+    # flat surface -> forward = spot
+    flat = pd.DataFrame({f"{e}x10Y": 80.0 for e in ["3M", "6M", "1Y", "2Y", "5Y"]}, index=idx)
+    sf = VolSurface(flat)
+    ok(np.allclose(sf.cal_forward(1, 1, "10Y"), 80.0), "flat surface forward != spot")
+    # total-variance additivity
+    rng = np.random.default_rng(0)
+    vols = pd.DataFrame({f"{e}x10Y": 70 + 10 * rng.random(300) for e in ["3M", "6M", "1Y", "2Y", "5Y"]}, index=idx)
+    sv = VolSurface(vols)
+    f = sv.cal_forward(1, 1, "10Y")
+    rec = np.sqrt((sv.spot(1, "10Y") ** 2 * 1 + f ** 2 * 1) / 2)
+    m = f.notna()
+    ok(np.allclose(rec[m], sv.spot(2, "10Y")[m]), "additivity")
+    # scalar interpolation used by the event engine matches the vectorized one
+    tsv = np.asarray(sv.terms["10Y"].columns, float)
+    for T in (0.1, 0.25, 0.8, 1.7, 7.0):
+        ok(abs(_tv(tsv, sv.terms["10Y"].to_numpy()[17], T) - sv.total_var(T, "10Y").iloc[17]) < 1e-9, "_tv")
+    # levels regression recovers OU mean reversion exactly (sigma_F - theta = e^{-k s}(sigma_S - theta))
+    th, kap, s = 75.0, 1.2, 0.5
+    S = pd.Series(75 + np.cumsum(rng.normal(0, 1, 2000)) * 0.3, index=pd.bdate_range("2015-01-01", periods=2000))
+    F = th + math.exp(-kap * s) * (S - th) + rng.normal(0, 1e-4, 2000)
+    r = rolling_ols(F, S, 252).iloc[-1]
+    k_hat, th_hat, _ = implied_mean_reversion(pd.Series([r.alpha]), pd.Series([r.beta]), s)
+    ok(abs(k_hat.iloc[0] - kap) < 1e-3 and abs(th_hat.iloc[0] - th) < 0.5, "implied kappa/theta")
+    # realized persistence of an AR(1): slope of x(t+h) on x(t) ~ phi^h
+    ph, nn, hh = 0.98, 60000, 21
+    x = np.zeros(nn)
+    e = rng.standard_normal(nn)
+    for i in range(1, nn):
+        x[i] = ph * x[i - 1] + e[i]
+    xs = pd.Series(x)
+    b = ols_nw(xs.shift(-hh), xs, lags=hh)["coef"][1]
+    ok(abs(b - ph ** hh) < 0.03, f"AR persistence {b:.3f} vs {ph ** hh:.3f}")
+    # OLS coefficients match lstsq
+    X = rng.normal(size=(500, 2))
+    yv = 1 + X @ np.array([0.5, -2]) + rng.normal(size=500)
+    rr = ols_nw(pd.Series(yv), [pd.Series(X[:, 0]), pd.Series(X[:, 1])], lags=5)
+    ref = np.linalg.lstsq(np.column_stack([np.ones(500), X]), yv, rcond=None)[0]
+    ok(np.allclose(rr["coef"], ref), "OLS coefficients")
+    # P&L convention: flat surface -> zero FVA P&L
+    cfg = Config(win_beta=60, win_z=60, theta_window=60)
+    pt = FvaPoint.parse("3Mx3Mx10Y")
+    g, _ = build_signals(sf, pt, cfg)
+    legs = leg_pnls(sf, pt, cfg, g)
+    ok(np.allclose(legs["fix"].dropna(), 0.0) and np.allclose(legs["mtm"].dropna(), 0.0), "flat-surface P&L")
+    # gamma/theta: flat implied 77bp, realized 70bp -> long 6M straddle held 21d loses
+    # (70^2 - 77^2) * (21/252) / (2 * 77 * 0.5) = -1.114 bp per unit vega
+    n2 = 20 * TD
+    idx2 = pd.bdate_range("2000-01-03", periods=n2)
+    gdf = pd.DataFrame({f"{e}x10Y": 77.0 for e in ["3M", "6M", "1Y", "2Y"]}, index=idx2)
+    gdf["SWAP_10Y"] = 3 + np.cumsum(rng.normal(0, 70 / math.sqrt(TD), n2)) / 100
+    gs = VolSurface(gdf)
+    p6 = FvaPoint.parse("6Mx6Mx10Y")
+    gg, _ = build_signals(gs, p6, Config())
+    lg = leg_pnls(gs, p6, Config(), gg)
+    theo = (70 ** 2 - 77 ** 2) * (21 / TD) / (2 * 77 * 0.5)
+    ok(abs(lg["spot_gamma"].mean() - theo) < 0.12, f"gamma/theta {lg['spot_gamma'].mean():.3f} vs {theo:.3f}")
+    # Stein estimator on long synthetic samples: over-reaction built in at 3M (kYQ < kY).
+    # No-premium, no-noise control: implied and realized persistence must agree (iterated expectations).
+    c0 = Config(cost_fva_bp=0.0, cost_spot_bp=0.0)
+    ctrl, _ = simulate(n_years=80, seed=3, kYQ=6.0, pi_st=0.0, pi_lt=0.0, noise_sd=0.0)
+    dc = run_point(VolSurface(ctrl), FvaPoint.parse("3Mx3Mx10Y"), c0, tranche=[], events=[]).diag
+    ok(abs(dc["stein_gap"]) < 0.04, f"control: stein gap should be ~0, got {dc['stein_gap']:.3f}")
+    ok(abs(dc["EH_b"] - 1) < 0.15, f"control: EH slope should be ~1, got {dc['EH_b']:.2f}")
+    lng, _ = simulate(n_years=80, seed=3, noise_sd=0.0)
+    dl = run_point(VolSurface(lng), FvaPoint.parse("3Mx3Mx10Y"), c0, tranche=[], events=[]).diag
+    ok(dl["stein_gap"] > 0.03 and dl["EH_b"] > 1, "over-reaction (kYQ < kY) not detected")
+    # recovery + engine consistency on the standard 16y synthetic surface
+    df, truth = simulate()
+    surf = VolSurface(df)
+    r33 = run_point(surf, FvaPoint.parse("3Mx3Mx10Y"), c0)
+    r11 = run_point(surf, FvaPoint.parse("1Yx1Yx10Y"), c0, tranche=[], events=["ev_long_fva_to_fixing"])
+    st = r33.stats.set_index("strategy")
+    ok(r33.diag["mean_carry_bp"] > 0 and r11.diag["mean_carry_bp"] > 0, "premium structure -> positive carry")
+    ok(st.at["resid_mr", "gross_bp_trade"] > 0, "residual mean reversion should pay gross of costs")
+    ok(st.at["long_fva_fix", "gross_bp_trade"] > 0, "long FVA should earn the premium term structure")
+    tr = r11.events["ev_long_fva_to_fixing"][0]
+    fx = r11.legs["fix"].reindex(tr["entry"]).to_numpy()
+    ok(np.allclose(tr["gross_bp"].to_numpy()[:-1], fx[:-1], atol=1e-8), "event engine != hold-to-fixing leg")
+    # FVA-only carry accounting: on a vol surface that never changes, the h-day MTM of a long FVA is
+    # exactly its roll along the forward-vol curve, i.e. the carry signal
+    stat = pd.DataFrame({"3Mx10Y": 92.0, "6Mx10Y": 88.0, "1Yx10Y": 84.0, "2Yx10Y": 80.0, "3Yx10Y": 78.0,
+                         "5Yx10Y": 76.0}, index=pd.bdate_range("2018-01-01", periods=400))
+    ss = VolSurface(stat)
+    p11 = FvaPoint.parse("1Yx1Yx10Y")
+    gst, _ = build_signals(ss, p11, Config())
+    lst = leg_pnls(ss, p11, Config(), gst)
+    mm = lst["mtm"].notna()
+    ok(mm.any() and np.allclose(lst["mtm"][mm], gst["roll_h"][mm]), "static surface: FVA MTM != roll")
+    ok(bool((gst["roll_h"] > 0).all()), "a vol curve falling with expiry should give long FVA positive roll")
+    # FVA vs FVA engine: identical legs with beta 1 must make exactly zero gross P&L
+    pa = FvaPoint.parse("6Mx1Yx10Y")
+    gp, ga, gb = build_pair_signals(surf, pa, pa, c0)
+    gp = gp.assign(beta=1.0, resid_z=0.0, ctr_z=0.0)
+    one = pd.Series(1.0, index=gp.index)
+    trp, _ = pair_event_backtest(surf, pa, pa, c0, gp, ga, gb, one, one, 63)
+    ok(len(trp) > 10 and float(np.abs(trp["gross_bp"]).max()) < 1e-9, "identical-leg pair should make zero P&L")
+    # cross-sectional carry book is vega-neutral: weights sum to 0, one unit long and one unit short
+    pts = [FvaPoint.parse(x) for x in ("3Mx3Mx10Y", "6Mx6Mx10Y", "6Mx1Yx10Y", "1Yx1Yx10Y")]
+    rs = {pt.name: run_point(surf, pt, c0, tranche=[], events=[]) for pt in pts}
+    _, wx, _ = xs_carry(rs, c0)
+    wv = wx.dropna(how="all")
+    ok(len(wv) > 100 and np.allclose(wv.sum(axis=1), 0) and np.allclose(wv.abs().sum(axis=1), 2), "xs weights")
+    if verbose:
+        print("selftest: all checks passed")
+        print(f"  synthetic truth: {truth}")
+        print(f"  gamma/theta check: {lg['spot_gamma'].mean():.3f} vs theory {theo:.3f} bp")
+        print(f"  80y control (no premium, kQ=kP)  3Mx3M: stein gap {dc['stein_gap']:+.3f}, EH b {dc['EH_b']:.2f}")
+        print(f"  80y over-reaction (kYQ<kY)        3Mx3M: stein gap {dl['stein_gap']:+.3f}, EH b {dl['EH_b']:.2f}")
+        for nm, rp in (("3Mx3Mx10Y", r33), ("1Yx1Yx10Y", r11)):
+            d = rp.diag
+            print(f"  16y {nm}: carry {d['mean_carry_bp']:.2f}bp | beta lvl {d['beta_levels']:.3f} vs realized "
+                  f"{d['beta_realized_h']:.3f} (se {d['se_beta_realized']:.3f}) | EH b {d['EH_b']:.2f} "
+                  f"(t vs 1: {d['EH_t(b=1)']:.1f}) | ~{d['n_independent']:.0f} independent obs")
+        print(f"  static vol curve: 1Yx1Yx10Y FVA MTM equals its roll exactly "
+              f"({gst['roll_h'].iloc[0]:+.3f}bp per {Config().hold_days} days)")
+        print("  identical-leg FVA pair: zero P&L; cross-sectional carry book: vega-neutral")
+
+
+# =============================================================================
+# 10. Reporting / CLI
+# =============================================================================
+def plot_point(r: PointResult, path: str,
+               events=("ev_fva_carry", "ev_fva_carry_value", "ev_long_fva_to_fixing", "ev_stein_fade_to_fixing",
+                       "ev_resid_mr", "ev_long_fwd_short_spot")) -> str:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    g = r.signals
+    fig, ax = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+    ax[0].plot(g.index, g["spot"], lw=1, label=f"spot {fmt_years(r.point.expiry)}x{r.point.tenor}")
+    ax[0].plot(g.index, g["fwd"], lw=1, label=f"forward {r.point.name} ({r.source})")
+    ax[0].set_ylabel("normal vol (bp)")
+    ax[0].legend(loc="upper left", frameon=False)
+    ax[1].plot(g.index, g["beta_lvl"], lw=.8, alpha=.6, label="beta levels, 1y rolling")
+    ax[1].plot(g.index, g["beta_lvl_long"], lw=1.2, label="beta levels, expanding (implied persistence)")
+    ax[1].plot(g.index, g["beta_real"], lw=1.2, label="realized persistence over the start")
+    ax[1].plot(g.index, g["beta_chg"], lw=.8, alpha=.6, label="beta changes (hedge ratio)")
+    ax[1].set_ylabel("beta")
+    ax[1].legend(loc="upper left", frameon=False, fontsize=8)
+    ax[2].plot(g.index, g["resid_z"], lw=.8, label="residual z (value)")
+    ax[2].plot(g.index, g["ctr_z"], lw=.8, label="FVA carry-to-risk z (roll)")
+    ax[2].plot(g.index, g["beta_lvl_z"], lw=.8, label="levels-beta z")
+    ax[2].axhline(0, color="k", lw=.5)
+    ax[2].set_ylabel("z")
+    ax[2].legend(loc="upper left", frameon=False, fontsize=8)
+    for s in events:
+        if s in r.events:
+            d = r.events[s][1]
+            ax[3].plot(d.index, d.cumsum(), lw=1, label=s)
+    ax[3].axhline(0, color="k", lw=.5)
+    ax[3].set_ylabel("cum P&L net of costs (bp vega)")
+    ax[3].legend(loc="upper left", frameon=False, fontsize=8)
+    fig.suptitle(f"{r.point.name}: forward vs spot vol", y=0.995)
+    fig.tight_layout()
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+    return path
+
+
+def _print_report(tr: pd.DataFrame, ev: pd.DataFrame, res: dict, cfg: Config, top: int = 12) -> None:
+    pd.set_option("display.width", 240)
+    pd.set_option("display.max_columns", 30)
+    print("\n=== Diagnostics (full sample, Newey-West) ===")
+    print(pd.DataFrame({k: r.diag for k, r in res.items()}).round(3).to_string())
+    tcols = [c for c in ["point", "strategy", "hold_d", "active%", "gross_bp_trade", "net_bp_trade", "hit%",
+                         "bp_per_yr", "sharpe", "t_nw", "worst_bp", "sharpe_oos", "bp_per_yr_oos"] if c in tr]
+    print(f"\n=== Signal quality: tranche engine (top {top}) ===")
+    print(tr[tcols].head(top).round(2).to_string(index=False))
+    ecols = [c for c in ["point", "strategy", "trades", "avg_hold_d", "gross_bp_trade", "net_bp_trade", "hit%",
+                         "bp_per_yr", "sharpe", "t_nw", "max_dd_bp", "sharpe_oos", "bp_per_yr_oos"] if c in ev]
+    print(f"\n=== Tradable: event engine, net of costs (top {top}) ===")
+    print(ev[ecols].head(top).round(2).to_string(index=False))
+    print("\n=== Today's snapshot ===")
+    print(snapshot(res, cfg).round(3).T.to_string())
+
+
+def _print_fva_only(pair_rank, pres, xs_tab) -> None:
+    if pair_rank is not None:
+        pcols = [c for c in ["point", "strategy", "trades", "avg_hold_d", "gross_bp_trade", "net_bp_trade", "hit%",
+                             "bp_per_yr", "sharpe", "t_nw", "max_dd_bp", "sharpe_oos", "bp_per_yr_oos"]
+                 if c in pair_rank]
+        print("\n=== FVA vs FVA pairs: event engine, net of costs ===")
+        print(pd.DataFrame({k: r["diag"] for k, r in pres.items()}).round(3).to_string())
+        print(pair_rank[pcols].round(2).to_string(index=False))
+    if xs_tab is not None:
+        xcols = [c for c in ["portfolio", "sample", "hold_d", "gross_bp_trade", "net_bp_trade", "hit%", "bp_per_yr",
+                             "sharpe", "t_nw", "max_dd_bp"] if c in xs_tab]
+        print("\n=== Cross-sectional FVA carry book (tranche engine, vega-neutral) ===")
+        print(xs_tab[xcols].round(2).to_string(index=False))
+
+
+def main(argv=None) -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--demo", action="store_true")
+    ap.add_argument("--csv")
+    ap.add_argument("--points", default="3Mx3Mx10Y,6Mx6Mx10Y,1Yx1Yx10Y")
+    ap.add_argument("--split", default=None, help="in/out-of-sample split date, e.g. 2021-01-01")
+    ap.add_argument("--rate-units", default="pct", choices=["pct", "bp"])
+    ap.add_argument("--hold", type=int, default=21)
+    ap.add_argument("--max-hold", type=int, default=63)
+    ap.add_argument("--cost-fva", type=float, default=1.5, help="round-trip cost, vol bp (placeholder)")
+    ap.add_argument("--cost-spot", type=float, default=1.0, help="round-trip cost, vol bp (placeholder)")
+    ap.add_argument("--source", default="auto", choices=["auto", "marks", "midcurve", "calendar"])
+    ap.add_argument("--pairs", default=None, help="FVA vs FVA pairs, e.g. 6Mx1Yx10Y:2Yx1Yx10Y,3Mx6Mx10Y:1Yx6Mx10Y")
+    ap.add_argument("--xs", action="store_true", help="cross-sectional FVA carry book over --points")
+    ap.add_argument("--out", default="fva_lab_out")
+    a = ap.parse_args(argv)
+    if a.selftest:
+        selftest()
+        return
+    if a.demo:
+        df, truth = simulate()
+        print("Synthetic surface (validation only - says nothing about the real market):", truth)
+        split = a.split or "2020-01-01"
+        if a.points == ap.get_default("points"):
+            a.points = "3Mx3Mx10Y,6Mx6Mx10Y,6Mx1Yx10Y,1Yx1Yx10Y,2Yx1Yx10Y"
+        a.pairs = a.pairs or "6Mx1Yx10Y:2Yx1Yx10Y,3Mx6Mx10Y:1Yx6Mx10Y"
+        a.xs = True
+    elif a.csv:
+        df = pd.read_csv(a.csv, index_col=0, parse_dates=True)
+        split = a.split
+    else:
+        ap.print_help()
+        return
+    surf = VolSurface(df, rate_units=a.rate_units)
+    cfg = Config(hold_days=a.hold, max_hold=a.max_hold, cost_fva_bp=a.cost_fva, cost_spot_bp=a.cost_spot,
+                 source=a.source)
+    points = [FvaPoint.parse(x) for x in a.points.split(",")]
+    tr, ev, res = scan(surf, points, cfg, split=split)
+    _print_report(tr, ev, res, cfg)
+    pair_rank, pres, xs_tab = None, {}, None
+    if a.pairs:
+        pairs = [tuple(FvaPoint.parse(x) for x in s.split(":")) for s in a.pairs.split(",")]
+        pair_rank, pres = scan_pairs(surf, pairs, cfg, split=split)
+    if a.xs:
+        xs_tab = pd.concat([xs_carry(res, cfg, split, sig)[0] for sig in ("ctr", "fva_score")], ignore_index=True)
+    _print_fva_only(pair_rank, pres, xs_tab)
+    os.makedirs(a.out, exist_ok=True)
+    tr.to_csv(os.path.join(a.out, "ranking_tranche.csv"), index=False)
+    ev.to_csv(os.path.join(a.out, "ranking_event.csv"), index=False)
+    if pair_rank is not None:
+        pair_rank.to_csv(os.path.join(a.out, "ranking_pairs.csv"), index=False)
+    if xs_tab is not None:
+        xs_tab.to_csv(os.path.join(a.out, "xs_carry.csv"), index=False)
+    snapshot(res, cfg).to_csv(os.path.join(a.out, "snapshot.csv"))
+    pd.DataFrame({k: r.diag for k, r in res.items()}).to_csv(os.path.join(a.out, "diagnostics.csv"))
+    for name, r in res.items():
+        r.signals.to_csv(os.path.join(a.out, f"signals_{name}.csv"))
+        plot_point(r, os.path.join(a.out, f"chart_{name}.png"))
+    print(f"\nwrote rankings, snapshot, diagnostics, signals_*.csv, chart_*.png to {a.out}/")
+
+
+if __name__ == "__main__":
+    main()
